@@ -2,13 +2,13 @@
 GX Works2 MCP Server (Codex-Gx / Antigravity / VS Code Compatible)
 ==================================================================
 A complete Model Context Protocol (MCP) stdio server for Mitsubishi MELSOFT
-GX Works2 (FX3U / FX3UC projects only).
+GX Works2 (FXCPU, QCPU, and LCPU projects).
 
 This server replicates the exact workflow seen in the "Codex-Gx" demonstration
 and incorporates patterns from open-source PLC MCP projects (such as
 github.com/Arienax/gxworks-agent):
 
-1. Pre-Flight FX3U/FX3UC Mnemonic and Device Validator:
+1. Pre-Flight family-aware Mnemonic and Device Validator:
    - Rejects unsupported opcodes, invalid operands and out-of-range devices before GX Works2 I/O.
    - Enforces octal X/Y addressing and conservative linear-rung structure.
 
@@ -43,6 +43,7 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -88,9 +89,72 @@ GX_READ_CSV_COMMAND = 0x755
 GX_WRITE_CSV_COMMAND = 0x756
 GX_CSV_DIALOG_TIMEOUT = 15.0
 GX_CSV_OPERATION_TIMEOUT = 30.0
-SUPPORTED_PLC_TYPE = "FX3U/FX3UC"
+GXWORKS2_EXECUTABLE_ENV = "GXWORKS2_EXE"
 GUI_TRANSACTION_LOCK = threading.RLock()
 GUI_ACTIVE_WRITE: Dict[str, Any] = {}
+
+
+@dataclass(frozen=True)
+class PLCProfile:
+    """Safe, family-level capabilities used for CSV and device validation."""
+    name: str
+    csv_prefix: str
+    x_y_base: int
+    ranges: Dict[str, Optional[Tuple[int, int]]]
+    m_segments: Optional[Tuple[Tuple[int, int], ...]] = None
+
+
+PLC_PROFILES: Dict[str, PLCProfile] = {
+    "FXCPU": PLCProfile(
+        "FX3U/FX3UC", "FXCPU", 8,
+        {"X": (0, 0o377), "Y": (0, 0o377), "M": None, "S": (0, 4095),
+         "T": (0, 511), "C": (0, 255), "D": (0, 8511), "V": (0, 7), "Z": (0, 7)},
+        ((0, 7679), (8000, 8511)),
+    ),
+    "QCPU": PLCProfile(
+        "QCPU", "QCPU", 16,
+        {"X": (0, 0xFFF), "Y": (0, 0xFFF), "M": (0, 8191), "S": (0, 2047),
+         "T": (0, 2047), "C": (0, 1023), "D": (0, 12287), "W": (0, 0x7FFF),
+         "R": (0, 32767), "Z": (0, 19)},
+    ),
+    "LCPU": PLCProfile(
+        "LCPU", "LCPU", 16,
+        {"X": (0, 0xFFF), "Y": (0, 0xFFF), "M": (0, 8191), "S": (0, 2047),
+         "T": (0, 2047), "C": (0, 1023), "D": (0, 9999), "W": (0, 0x7FFF),
+         "R": (0, 32767), "Z": (0, 19)},
+    ),
+}
+
+PLC_TYPE_ALIASES: Dict[str, str] = {
+    "FX": "FXCPU", "FXCPU": "FXCPU", "FX1S": "FXCPU", "FX1N": "FXCPU",
+    "FX2N": "FXCPU", "FX2NC": "FXCPU", "FX3S": "FXCPU", "FX3G": "FXCPU",
+    "FX3U": "FXCPU", "FX3UC": "FXCPU", "FX3U/FX3UC": "FXCPU",
+    "Q": "QCPU", "QCPU": "QCPU", "L": "LCPU", "LCPU": "LCPU",
+}
+
+
+def resolve_plc_profile(plc_type: str) -> Tuple[Optional[PLCProfile], Optional[str]]:
+    """Resolve a family or known model name without guessing unknown models."""
+    if not isinstance(plc_type, str) or not plc_type.strip():
+        return None, "plc_type must be a non-empty string."
+    requested = re.sub(r"\s+", "", plc_type.strip().upper())
+    family_key = PLC_TYPE_ALIASES.get(requested)
+    if family_key is None:
+        if requested.startswith("FX"):
+            family_key = "FXCPU"
+        elif requested.startswith("Q"):
+            family_key = "QCPU"
+        elif requested.startswith("L"):
+            family_key = "LCPU"
+    if family_key is None or family_key not in PLC_PROFILES:
+        return None, (
+            f"Unsupported plc_type '{plc_type}'. Use an FXCPU, QCPU, or LCPU family/model "
+            "known to GX Works2."
+        )
+    base = PLC_PROFILES[family_key]
+    return PLCProfile(
+        plc_type.strip(), base.csv_prefix, base.x_y_base, base.ranges, base.m_segments
+    ), None
 
 # Supported conservative FX3U/FX3UC instruction subset and operand counts.
 SUPPORTED_OPCODES: Dict[str, Tuple[int, int]] = {
@@ -189,12 +253,12 @@ NEGATIVE_OPCODE_HINTS: Dict[str, str] = {
 
 OCTAL_DEVICE_REGEX = re.compile(r"^([XY])(\d+)$", re.IGNORECASE)
 VALID_DEVICE_REGEX = re.compile(
-    r"^(X[0-7]+|Y[0-7]+|M\d+|S\d+|T\d+|C\d+|D\d+|V\d+|Z\d+|K-?\d+|H[0-9A-Fa-f]+)$",
+    r"^(X[0-9A-Fa-f]+|Y[0-9A-Fa-f]+|M\d+|S\d+|T\d+|C\d+|D\d+|V\d+|Z\d+|W[0-9A-Fa-f]+|R\d+|K-?\d+|H[0-9A-Fa-f]+)$",
     re.IGNORECASE,
 )
 
 BIT_DEVICES = {"X", "Y", "M", "S", "T", "C"}
-WORD_DEVICES = {"D", "T", "C", "V", "Z"}
+WORD_DEVICES = {"D", "T", "C", "V", "Z", "W", "R"}
 CONTACT_OPCODES = {
     "LD", "LDI", "LDP", "LDF", "AND", "ANI", "ANDP", "ANDF",
     "OR", "ORI", "ORP", "ORF",
@@ -269,31 +333,32 @@ def calculate_instruction_steps(opcode: str, operands: List[str]) -> int:
     return 1
 
 
-def _device_range_error(operand: str) -> Optional[str]:
-    """Return a range error for built-in FX3U/FX3UC devices, if any."""
+def _device_range_error(operand: str, profile: PLCProfile = PLC_PROFILES["FXCPU"]) -> Optional[str]:
+    """Return a range error for the selected GX Works2 PLC family."""
     if not VALID_DEVICE_REGEX.fullmatch(operand):
         return f"Invalid device or constant syntax '{operand}'."
-    m = re.fullmatch(r"([A-Z]+)(\d+)", operand)
+    m = re.fullmatch(r"([A-Z]+)([0-9A-F]+)", operand)
     if not m:
         return None
     prefix, raw_number = m.groups()
-    if prefix in ("X", "Y") and any(digit in "89" for digit in raw_number):
-        return f"Invalid octal address '{operand}'."
-    number = int(raw_number, 8) if prefix in ("X", "Y") else int(raw_number)
-    ranges = {
-        "X": (0, 0o377), "Y": (0, 0o377),
-        "M": None, "S": (0, 4095), "T": (0, 511), "C": (0, 255),
-        "D": (0, 8511), "V": (0, 7), "Z": (0, 7),
-    }
+    if profile.x_y_base == 8 and prefix in ("X", "Y"):
+        if any(digit in "89ABCDEFabcdef" for digit in raw_number):
+            return f"Invalid octal address '{operand}' for {profile.name}."
+    try:
+        number = int(raw_number, profile.x_y_base if prefix in ("X", "Y") else 10)
+    except ValueError:
+        return f"Invalid {profile.name} device address '{operand}'."
+    ranges = profile.ranges
     if prefix not in ranges:
-        return f"Unsupported FX3U/FX3UC device '{operand}'."
-    if prefix == "M":
-        if 0 <= number <= 7679 or 8000 <= number <= 8511:
-            return None
-        return f"M device '{operand}' is outside supported FX3U/FX3UC ranges M0-M7679 and M8000-M8511."
-    low, high = ranges[prefix]
+        return f"Unsupported {profile.name} device '{operand}'."
+    range_value = ranges[prefix]
+    if range_value is None:
+        if profile.m_segments and prefix == "M" and not any(low <= number <= high for low, high in profile.m_segments):
+            return f"Device '{operand}' is outside the supported {profile.name} M-device ranges."
+        return None
+    low, high = range_value
     if not low <= number <= high:
-        return f"Device '{operand}' is outside the FX3U/FX3UC range for {prefix} (0-{high})."
+        return f"Device '{operand}' is outside the {profile.name} range for {prefix} (0-{high})."
     return None
 
 
@@ -302,12 +367,12 @@ def _operand_kind(operand: str) -> str:
         return "constant"
     if re.fullmatch(r"H[0-9A-F]+", operand):
         return "constant"
-    m = re.fullmatch(r"([A-Z]+)\d+", operand)
+    m = re.fullmatch(r"([A-Z]+)[0-9A-F]+", operand)
     return m.group(1) if m else "invalid"
 
 
 def _canonical_device(operand: str) -> str:
-    match = re.fullmatch(r"([A-Z]+)(\d+)", operand.upper())
+    match = re.fullmatch(r"([A-Z]+)([0-9A-F]+)", operand.upper())
     if not match:
         return operand.upper()
     prefix, digits = match.groups()
@@ -325,7 +390,7 @@ def _constant_range_error(operand: str) -> Optional[str]:
     return None
 
 
-def _validate_comment_map(device_comments: Any) -> List[str]:
+def _validate_comment_map(device_comments: Any, profile: PLCProfile = PLC_PROFILES["FXCPU"]) -> List[str]:
     errors: List[str] = []
     if device_comments is None:
         return errors
@@ -337,8 +402,8 @@ def _validate_comment_map(device_comments: Any) -> List[str]:
             errors.append("Every device comment key and value must be a string.")
             continue
         dev = _canonical_device(key.strip())
-        if _operand_kind(dev) in ("constant", "invalid") or not VALID_DEVICE_REGEX.fullmatch(dev) or _device_range_error(dev):
-            errors.append(f"Invalid or unsupported FX3U/FX3UC device comment address '{key}'.")
+        if _operand_kind(dev) in ("constant", "invalid") or not VALID_DEVICE_REGEX.fullmatch(dev) or _device_range_error(dev, profile):
+            errors.append(f"Invalid or unsupported {profile.name} device comment address '{key}'.")
         if dev in seen_devices:
             errors.append(f"Duplicate device comment address after normalization: '{key}'.")
         seen_devices.add(dev)
@@ -355,14 +420,20 @@ def validate_and_analyze_program(
     rungs_input: List[Dict[str, Any]],
     device_comments: Optional[Dict[str, str]] = None,
     auto_fix_negatives: bool = False,
+    plc_type: str = "FX3U/FX3UC",
 ) -> ValidationReport:
     """
     Validates ladder mnemonics and runs static engineering checks.
     Replicates the strict validation shown in the video where negative opcodes
     (like LDN/ANDN) or duplicate timer coils are caught before touching GX Works2.
     """
+    profile, profile_error = resolve_plc_profile(plc_type)
     report = ValidationReport()
-    report.errors.extend(_validate_comment_map(device_comments))
+    if profile_error:
+        report.valid = False
+        report.errors.append(profile_error)
+        return report
+    report.errors.extend(_validate_comment_map(device_comments, profile))
     if report.errors:
         report.valid = False
     out_coils_seen: Dict[str, int] = {}
@@ -430,7 +501,7 @@ def validate_and_analyze_program(
                 opcode = "OUT"
             if opcode not in SUPPORTED_OPCODES:
                 report.valid = False
-                report.errors.append(f"Rung {rung_idx}, line {inst_idx}: unsupported FX3U/FX3UC opcode '{opcode}'.")
+                report.errors.append(f"Rung {rung_idx}, line {inst_idx}: unsupported {profile.name} opcode '{opcode}'.")
                 continue
             if opcode == "END":
                 report.valid = False
@@ -451,8 +522,8 @@ def validate_and_analyze_program(
                 elif kind == "constant" and _constant_range_error(operand):
                     report.errors.append(f"Rung {rung_idx}, line {inst_idx}: {_constant_range_error(operand)}")
                     op_valid = False
-                elif kind not in ("constant",) and _device_range_error(operand):
-                    report.errors.append(f"Rung {rung_idx}, line {inst_idx}: {_device_range_error(operand)}")
+                elif kind not in ("constant",) and _device_range_error(operand, profile):
+                    report.errors.append(f"Rung {rung_idx}, line {inst_idx}: {_device_range_error(operand, profile)}")
                     op_valid = False
                 if kind not in ("constant", "invalid"):
                     report.devices_used.add(_canonical_device(operand))
@@ -592,9 +663,12 @@ def generate_gxworks2_ladder_csv(
     'Write to CSV File' / 'Read from CSV File' text layout.
     Note: GX Works2 expects UTF-16LE with BOM and Tab-separated quoted fields.
     """
+    profile, profile_error = resolve_plc_profile(plc_type)
+    if profile_error or profile is None:
+        raise ValueError(profile_error or f"Unsupported plc_type '{plc_type}'.")
     lines: List[List[str]] = [
         [project_title],
-        ["PLC Information:", f"FXCPU {plc_type}"],
+        ["PLC Information:", f"{profile.csv_prefix} {plc_type}"],
         [
             "Step No.",
             "Line Statement",
@@ -697,6 +771,13 @@ def parse_gxworks2_ladder_csv(filepath: Path) -> Dict[str, Any]:
     header = [field.strip() for field in rows[header_idx]]
     if header != expected_header:
         return {"error": "GX Works2 CSV header columns do not match the supported format."}
+    plc_information = ""
+    for row in rows[:header_idx]:
+        if len(row) >= 2 and row[0].strip() == "PLC Information:":
+            plc_information = row[1].strip()
+            break
+    if not plc_information:
+        return {"error": "GX Works2 CSV is missing PLC Information."}
 
     items: List[Dict[str, Any]] = []
     statements: List[str] = []
@@ -763,7 +844,20 @@ def parse_gxworks2_ladder_csv(filepath: Path) -> Dict[str, Any]:
             return {"error": f"Malformed operand count in CSV export for {item['opcode']}."}
 
     rung_count = sum(1 for item in instructions if item["opcode"].startswith("LD") and item["opcode"] != "END")
-    return {"file": str(filepath), "rung_count": rung_count, "last_step_no": max_step, "statements": statements, "items": items}
+    return {
+        "file": str(filepath),
+        "plc_information": plc_information,
+        "rung_count": rung_count,
+        "last_step_no": max_step,
+        "statements": statements,
+        "items": items,
+    }
+
+
+def plc_family_from_csv_info(plc_information: str) -> Optional[str]:
+    """Map GX Works2's CSV PLC Information prefix to a supported family."""
+    prefix = str(plc_information).strip().split(maxsplit=1)[0].upper() if plc_information else ""
+    return {"FXCPU": "FXCPU", "QCPU": "QCPU", "LCPU": "LCPU"}.get(prefix)
 
 
 def instruction_signature(items: List[Dict[str, Any]]) -> List[Tuple[str, Tuple[str, ...]]]:
@@ -864,6 +958,105 @@ class GXWorks2Controller:
                 False,
                 f"Could not attach to GX Works2 window (make sure GX Works2 is open with a project): {exc}",
             )
+
+    def launch(self) -> Tuple[bool, str]:
+        """Launch GX Works2 from an explicit path or common installation locations."""
+        if not PYWINAUTO_AVAILABLE:
+            return False, "pywinauto is not installed."
+        candidates = []
+        configured = os.environ.get(GXWORKS2_EXECUTABLE_ENV, "").strip()
+        if configured:
+            candidates.append(Path(configured))
+        candidates.extend(Path(value) for value in (
+            r"C:\Program Files (x86)\MELSOFT\GX Works2\GXW2.exe",
+            r"C:\Program Files\MELSOFT\GX Works2\GXW2.exe",
+        ))
+        executable = next((path for path in candidates if path.is_file()), None)
+        if executable is None:
+            return False, (
+                f"GX Works2 was not found. Set the {GXWORKS2_EXECUTABLE_ENV} environment "
+                "variable to GXW2.exe."
+            )
+        try:
+            subprocess.Popen([str(executable)], close_fds=True)
+            deadline = time.time() + 20.0
+            while time.time() < deadline:
+                ok, title = self.connect()
+                if ok:
+                    return True, title
+                time.sleep(0.5)
+            return False, "GX Works2 launched but its main window did not become available within 20 seconds."
+        except (OSError, ValueError) as exc:
+            return False, f"Could not launch GX Works2: {exc}"
+
+    @staticmethod
+    def _control_text(control: Any) -> str:
+        try:
+            return control.window_text().replace("&", "").strip()
+        except Exception:
+            return ""
+
+    def create_project(self, project_name: str, plc_type: str) -> Tuple[bool, str]:
+        """Create a new GX Works2 project and select a verified PLC model."""
+        profile, profile_error = resolve_plc_profile(plc_type)
+        if profile_error or profile is None:
+            return False, profile_error or "Unsupported PLC type."
+        if not project_name or not re.fullmatch(r"[A-Za-z0-9 _.-]{1,64}", project_name):
+            return False, "project_name must be 1-64 characters using letters, numbers, spaces, _, ., or -."
+        ok, title = self.connect()
+        if not ok:
+            ok, title = self.launch()
+        if not ok:
+            return False, title
+        try:
+            self.main_win.set_focus()
+            send_keys("^n")
+            deadline = time.time() + 8.0
+            dialog = None
+            while time.time() < deadline:
+                candidates = [
+                    window for window in self.app.windows(visible_only=True)
+                    if window.handle != self.main_win.handle and window.is_enabled()
+                ]
+                dialog = next((window for window in candidates if window.class_name() == "#32770"), None)
+                if dialog is not None:
+                    break
+                time.sleep(0.1)
+            if dialog is None:
+                return False, "GX Works2 did not open its New Project dialog."
+            edits = [child for child in dialog.descendants() if child.friendly_class_name() == "Edit"]
+            combos = [child for child in dialog.descendants() if child.friendly_class_name() == "ComboBox"]
+            if not edits or not combos:
+                return False, "New Project dialog did not expose project-name and PLC-type controls."
+            name_edit = next((edit for edit in edits if "name" in self._control_text(edit).lower()), edits[0])
+            name_edit.set_edit_text(project_name)
+            combo = None
+            for candidate in combos:
+                try:
+                    texts = [item.window_text().strip() for item in candidate.descendants()]
+                except Exception:
+                    texts = []
+                if any(profile.csv_prefix in text.upper() or plc_type.upper() in text.upper() for text in texts):
+                    combo = candidate
+                    break
+            combo = combo or combos[-1]
+            combo.select(plc_type)
+            selected = self._control_text(combo)
+            if plc_type.upper() not in selected.upper() and profile.csv_prefix not in selected.upper():
+                return False, f"GX Works2 did not confirm PLC selection '{plc_type}' (selected '{selected}')."
+            ok_button = next((
+                child for child in dialog.descendants()
+                if child.friendly_class_name() == "Button"
+                and self._control_text(child).lower() in ("ok", "create")
+            ), None)
+            if ok_button is None:
+                return False, "New Project dialog has no OK/Create button."
+            ok_button.click()
+            time.sleep(1.0)
+            self.project_key = None
+            return True, f"Created project '{project_name}' for {plc_type}."
+        except Exception as exc:
+            return False, f"Could not create GX Works2 project: {exc}"
 
     @staticmethod
     def project_key_from_title(title: str) -> str:
@@ -1233,7 +1426,7 @@ class GXWorks2Controller:
 mcp = FastMCP(
     "gxworks2-mcp",
     instructions=(
-        "GX Works2 offline ladder editing for FX3U/FX3UC only. Validate first, write only "
+        "GX Works2 offline ladder editing for FXCPU, QCPU, and LCPU families. Validate first, write only "
         "with MAIN active, and accept SUCCESS only after backup, build, Program Check, "
         "and exact readback verification. Never transfers to a PLC."
     ),
@@ -1295,9 +1488,59 @@ def gx_get_status() -> str:
             "main_editor_active": main_active,
             "window_info": title_or_err,
             "pywinauto_available": PYWINAUTO_AVAILABLE,
+            "supported_plc_families": sorted(PLC_PROFILES),
             "workspace_dir": str(WORKSPACE_DIR),
             "recent_csv_artifacts": recent_files,
         },
+        indent=2,
+    )
+
+
+@mcp.tool()
+def gx_list_supported_plc_types() -> str:
+    """Lists supported GX Works2 PLC families, aliases, and address conventions."""
+    return json.dumps(
+        {
+            "families": [
+                {
+                    "family": key,
+                    "csv_prefix": profile.csv_prefix,
+                    "addressing": "octal X/Y" if profile.x_y_base == 8 else "hexadecimal X/Y/W",
+                    "aliases": sorted(
+                        alias for alias, family in PLC_TYPE_ALIASES.items() if family == key
+                    ),
+                }
+                for key, profile in sorted(PLC_PROFILES.items())
+            ],
+            "note": (
+                "Family profiles use safe GX Works2 envelopes. The native Build and "
+                "Program Check remain authoritative for model-specific limits."
+            ),
+        },
+        indent=2,
+    )
+
+
+@mcp.tool()
+@serialized_gui
+def gx_create_project(project_name: str, plc_type: str) -> str:
+    """
+    Launches GX Works2 if necessary and creates a new project with the requested
+    FXCPU, QCPU, or LCPU model selected in the native New Project dialog.
+    """
+    ok, message = controller.create_project(project_name, plc_type)
+    if ok:
+        return json.dumps(
+            {
+                "success": True,
+                "project_name": project_name,
+                "plc_type": plc_type,
+                "message": message,
+            },
+            indent=2,
+        )
+    return json.dumps(
+        {"success": False, "error": message, "plc_type": plc_type},
         indent=2,
     )
 
@@ -1336,20 +1579,24 @@ def gx_validate_program(
     rungs: List[Dict[str, Any]],
     device_comments: Optional[Dict[str, str]] = None,
     auto_fix_negatives: bool = False,
+    plc_type: str = "FX3U/FX3UC",
 ) -> str:
     """
-    Pre-validates the conservative FX3U/FX3UC linear-rung subset without modifying GX Works2.
+    Pre-validates the conservative family-aware linear-rung subset without modifying GX Works2.
     Rejects unsupported instruction structures, malformed operands, out-of-range devices,
     malformed comments, invalid octal addresses, and duplicate timer/counter coils.
 
     Args:
         rungs: List of rung objects, each with {"statement": "optional rung title", "instructions": ["LD X0", "OUT Y0"]}.
         device_comments: Optional dictionary mapping devices (e.g., {"X0": "START", "Y0": "MAIN CONTACTOR"}) to comments.
+        plc_type: FXCPU/QCPU/LCPU family or a supported model name.
         auto_fix_negatives: If True, automatically converts LDN/ANDN/ORN to LDI/ANI/ORI.
     """
     if not isinstance(auto_fix_negatives, bool):
         return json.dumps({"valid": False, "errors": ["auto_fix_negatives must be a boolean."], "warnings": []}, indent=2)
-    report = validate_and_analyze_program(rungs, device_comments, auto_fix_negatives=auto_fix_negatives)
+    report = validate_and_analyze_program(
+        rungs, device_comments, auto_fix_negatives=auto_fix_negatives, plc_type=plc_type
+    )
     return json.dumps(
         {
             "valid": report.valid,
@@ -1377,14 +1624,14 @@ def gx_write_program(
     run_compile_and_check: bool = True,
 ) -> str:
     """
-    Validates, backs up, imports, builds, checks, and reads back an FX3U/FX3UC ladder in MAIN.
+    Validates, backs up, imports, builds, checks, and reads back a ladder in MAIN.
     Invalid candidates are rejected before GUI access. SUCCESS requires verified round-trip equality.
 
     Args:
         rungs: Ordered rung objects with optional statement and instruction list, e.g. [{"statement": "Motor start/stop", "instructions": ["LD X0", "OR M0", "ANI X1", "OUT M0"]}].
         device_comments: Optional dict of I/O comments, e.g. {"X0": "START", "X1": "STOP NO", "Y0": "MAIN CONTACTOR"}.
         delivery_mode: Must be "csv_import". Simulated keystroke entry is not used for writes.
-        plc_type: Target PLC series for CSV header (default "FX3U/FX3UC").
+        plc_type: Target GX Works2 PLC family/model for CSV header.
         run_compile_and_check: Must be True; a write is not successful without GX Works2 build/check.
     """
     controller.import_started = False
@@ -1393,12 +1640,14 @@ def gx_write_program(
         return json.dumps({"status": "REJECTED_BEFORE_WRITE", "error": "Only delivery_mode='csv_import' is supported for reliable writes."}, indent=2)
     if run_compile_and_check is not True:
         return json.dumps({"status": "REJECTED_BEFORE_WRITE", "error": "Build and program check are required; run_compile_and_check must be True."}, indent=2)
-    if not isinstance(plc_type, str) or plc_type.strip().upper() != SUPPORTED_PLC_TYPE:
-        return json.dumps({"status": "REJECTED_BEFORE_WRITE", "error": f"Only plc_type='{SUPPORTED_PLC_TYPE}' is supported."}, indent=2)
-    plc_type = SUPPORTED_PLC_TYPE
+    profile, profile_error = resolve_plc_profile(plc_type)
+    if profile_error or profile is None:
+        return json.dumps({"status": "REJECTED_BEFORE_WRITE", "error": profile_error}, indent=2)
 
     # 1. Pre-flight deterministic validation (rejects bad opcodes before touching GX Works2)
-    report = validate_and_analyze_program(rungs, device_comments, auto_fix_negatives=False)
+    report = validate_and_analyze_program(
+        rungs, device_comments, auto_fix_negatives=False, plc_type=plc_type
+    )
     if not report.valid:
         return json.dumps(
             {
@@ -1480,6 +1729,29 @@ def gx_write_program(
         return json.dumps({
             "status": "BACKUP_FAILED",
             "error": backup_parsed.get("error", "Backup CSV contains no parseable ladder instructions."),
+            "backup_csv": str(before_csv_path),
+        }, indent=2)
+    active_family = plc_family_from_csv_info(backup_parsed.get("plc_information", ""))
+    requested_family = PLC_TYPE_ALIASES.get(
+        re.sub(r"\s+", "", plc_type.strip().upper()),
+        "FXCPU" if plc_type.strip().upper().startswith("FX")
+        else "QCPU" if plc_type.strip().upper().startswith("Q")
+        else "LCPU" if plc_type.strip().upper().startswith("L")
+        else None,
+    )
+    if active_family is None:
+        return json.dumps({
+            "status": "REJECTED_BEFORE_WRITE",
+            "error": f"Active project CSV reported an unsupported PLC family: {backup_parsed.get('plc_information')}",
+            "backup_csv": str(before_csv_path),
+        }, indent=2)
+    if active_family != requested_family:
+        return json.dumps({
+            "status": "PLC_TYPE_MISMATCH",
+            "error": (
+                f"Active project is {active_family}, but plc_type='{plc_type}' "
+                f"requests {requested_family}. Create/open the correct project first."
+            ),
             "backup_csv": str(before_csv_path),
         }, indent=2)
 

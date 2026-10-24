@@ -90,6 +90,27 @@ class MockController:
 
 
 class ValidatorTests(unittest.TestCase):
+    def test_supported_plc_families_use_family_specific_addressing(self):
+        for plc_type in ("QCPU", "LCPU", "Q03UDCPU", "L26CPU-BT"):
+            with self.subTest(plc_type=plc_type):
+                report = MODULE.validate_and_analyze_program(
+                    [{"instructions": ["LD X8", "MOV K1 D0"]}],
+                    plc_type=plc_type,
+                )
+                self.assertTrue(report.valid, report.errors)
+        self.assertFalse(
+            MODULE.validate_and_analyze_program(
+                [{"instructions": ["LD X8", "OUT Y0"]}], plc_type="FX3U/FX3UC"
+            ).valid
+        )
+
+    def test_unknown_plc_type_is_rejected(self):
+        report = MODULE.validate_and_analyze_program(
+            [{"instructions": ["LD X0", "OUT Y0"]}], plc_type="UNKNOWN-PLC"
+        )
+        self.assertFalse(report.valid)
+        self.assertIn("Unsupported plc_type", report.errors[0])
+
     def test_representative_ladder_passes(self):
         report = MODULE.validate_and_analyze_program(SAMPLE)
         self.assertTrue(report.valid, report.errors)
@@ -126,6 +147,15 @@ class ValidatorTests(unittest.TestCase):
 
 
 class CsvTests(unittest.TestCase):
+    def test_csv_header_uses_selected_plc_family(self):
+        q_csv = MODULE.generate_gxworks2_ladder_csv(
+            MODULE.validate_and_analyze_program(
+                SAMPLE, plc_type="QCPU"
+            ).normalized_rungs,
+            plc_type="QCPU",
+        )
+        self.assertIn('"PLC Information:"\t"QCPU QCPU"', q_csv)
+
     def test_candidate_roundtrip_preserves_instructions_and_statements(self):
         with tempfile.TemporaryDirectory() as temp:
             path = MODULE.save_utf16le_csv(csv_for(SAMPLE), Path(temp) / "ladder.csv")

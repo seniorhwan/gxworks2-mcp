@@ -1,6 +1,27 @@
 # GX Works2 MCP: instructions for AI agents
 
-This server edits the offline `MAIN` ladder program in the currently open GX Works2 FX3U/FX3UC project. It does not transfer a program to a PLC.
+This server edits offline `MAIN` ladder programs in GX Works2 FXCPU, QCPU, and LCPU projects. It does not transfer a program to a PLC.
+
+## PLC families and project creation
+
+`plc_type` accepts the family names `FXCPU`, `QCPU`, and `LCPU`, plus model
+names beginning with `FX`, `Q`, or `L` (for example `FX3U/FX3UC`,
+`Q03UDCPU`, or `L26CPU-BT`). The validator applies family-specific address
+rules: FX X/Y addresses are octal, while Q/L X/Y and W addresses are
+hexadecimal. Unknown model families are rejected rather than guessed.
+
+Use `gx_create_project` to launch GX Works2 when needed and create a new
+project through the native New Project dialog:
+
+```json
+{"project_name": "Line-1", "plc_type": "Q03UDCPU"}
+```
+
+If GX Works2 is installed outside its standard paths, set
+`GXWORKS2_EXE` to the full path of `GXW2.exe`. The native dialog must expose
+the requested model; the tool fails explicitly if it cannot confirm the
+selection. Project creation only creates the offline project and never
+downloads to a PLC.
 
 ## Safe call sequence
 
@@ -32,11 +53,16 @@ Pass `rungs` as an ordered array. Each rung has an optional statement and an ord
 
 Operands are whitespace separated. Use supported Mitsubishi mnemonics, not IEC aliases such as `TON`, `CTU`, `LDN`, or `ANDN`. Branch/stack instructions are deliberately rejected until their structure can be round-tripped without flattening.
 
-The validator is limited to the supported FX3U/FX3UC device subset and built-in address ranges. X/Y addresses are octal (for example, `X10` follows `X7`; `X8` is invalid). Use `gx_validate_program` as the authority for the accepted syntax. The target parameter must be `FX3U/FX3UC`; other PLC families are rejected.
+The validator is limited to the supported safe instruction subset and the
+selected family’s built-in address ranges. Use `gx_validate_program` as the
+authority for accepted syntax. The safe ladder subset is intentionally
+conservative across PLC families; model-specific instructions are rejected
+until they can be round-tripped and verified.
 
 ## Tools
 
 - `gx_get_status`: report GX Works2 connection and whether MAIN is active.
+- `gx_create_project`: launch GX Works2 if necessary and create a typed offline project.
 - `gx_read_program`: export and parse the active MAIN program.
 - `gx_validate_program`: validate the candidate without modifying GX Works2.
 - `gx_write_program`: validate, back up, replace, build, check, and read back MAIN. Keep the returned backup path on failure.
@@ -44,4 +70,3 @@ The validator is limited to the supported FX3U/FX3UC device subset and built-in 
 - `gx_write_device_comments`: save a comments CSV artifact. Automatic GUI import is unsupported. Comment text is limited to 32 characters and must not include quotes or control characters.
 
 The tool serializes GUI operations. Generated artifacts are written to the server's `Documents/Codex-Gx` directory with unique names; existing files are never overwritten. Missing or unrecognized GUI results are failures.
-
