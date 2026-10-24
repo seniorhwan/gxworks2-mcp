@@ -345,7 +345,8 @@ def _device_range_error(operand: str, profile: PLCProfile = PLC_PROFILES["FXCPU"
         if any(digit in "89ABCDEFabcdef" for digit in raw_number):
             return f"Invalid octal address '{operand}' for {profile.name}."
     try:
-        number = int(raw_number, profile.x_y_base if prefix in ("X", "Y") else 10)
+        address_base = profile.x_y_base if prefix in ("X", "Y", "W") else 10
+        number = int(raw_number, address_base)
     except ValueError:
         return f"Invalid {profile.name} device address '{operand}'."
     ranges = profile.ranges
@@ -902,16 +903,25 @@ def candidate_signatures(rungs: List[RungSpec]) -> Tuple[List[Tuple[str, Tuple[s
     return instructions, statements
 
 
-def generate_gxworks2_comment_csv(comments: Dict[str, str], label_name: str = "COMMENT") -> str:
+def generate_gxworks2_comment_csv(
+    comments: Dict[str, str],
+    plc_type: str = "FX3U/FX3UC",
+    label_name: str = "GLOBAL DEVICE COMMENTS",
+) -> str:
     """
-    Generates a GX Works2 Device Comment CSV file (UTF-16LE, Tab-separated).
-    Columns: "Device Name", "Comment"
+    Generates a deterministic global device-comment CSV artifact.
+    The file is intentionally separate from ladder CSV because GX Works2
+    imports comments through its Device Comment editor.
     """
+    profile, profile_error = resolve_plc_profile(plc_type)
+    if profile_error or profile is None:
+        raise ValueError(profile_error or f"Unsupported plc_type '{plc_type}'.")
     rows = [
         [label_name],
+        ["PLC Information:", f"{profile.csv_prefix} {plc_type}"],
         ["Device Name", "Comment"],
     ]
-    for dev, comm in comments.items():
+    for dev, comm in sorted(comments.items(), key=lambda item: _canonical_device(item[0].strip())):
         rows.append([_canonical_device(dev.strip()), comm.strip()])
 
     output_rows = []
@@ -919,6 +929,51 @@ def generate_gxworks2_comment_csv(comments: Dict[str, str], label_name: str = "C
         quoted = [f'"{c.replace(chr(34), chr(34)*2)}"' for c in r]
         output_rows.append("\t".join(quoted))
     return "\r\n".join(output_rows) + "\r\n"
+
+
+def parse_gxworks2_comment_csv(filepath: Path) -> Dict[str, Any]:
+    """Parse and validate a global device-comment artifact produced by this server."""
+    try:
+        raw_bytes = filepath.read_bytes()
+        if not raw_bytes.startswith(b"\xff\xfe"):
+            return {"error": "Comment CSV is missing a UTF-16LE BOM."}
+        text = raw_bytes[2:].decode("utf-16-le", errors="strict")
+        rows = list(csv.reader(io.StringIO(text, newline=""), delimiter="\t", quotechar='"', strict=True))
+    except (FileNotFoundError, OSError, UnicodeError, csv.Error) as exc:
+        return {"error": f"Comment CSV could not be read: {exc}"}
+    info = next(
+        (row[1].strip() for row in rows if len(row) >= 2 and row[0].strip() == "PLC Information:"),
+        "",
+    )
+    header_idx = next(
+        (index for index, row in enumerate(rows) if row[:2] == ["Device Name", "Comment"]),
+        None,
+    )
+    if not info or header_idx is None:
+        return {"error": "Not a recognized global device-comment CSV."}
+    comments: Dict[str, str] = {}
+    for row_num, row in enumerate(rows[header_idx + 1:], start=header_idx + 2):
+        if not row or not any(cell.strip() for cell in row):
+            continue
+        if len(row) != 2 or not row[0].strip() or not row[1].strip():
+            return {"error": f"Malformed comment row {row_num}."}
+        device = _canonical_device(row[0].strip())
+        if device in comments:
+            return {"error": f"Duplicate device comment address '{device}' at row {row_num}."}
+        comments[device] = row[1].strip()
+    family = plc_family_from_csv_info(info)
+    if family is None:
+        return {"error": f"Unsupported PLC family in comment CSV: {info}"}
+    profile = PLC_PROFILES[family]
+    errors = _validate_comment_map(comments, profile)
+    if errors:
+        return {"error": " | ".join(errors)}
+    return {
+        "file": str(filepath),
+        "plc_information": info,
+        "comment_count": len(comments),
+        "comments": comments,
+    }
 
 
 # ============================================================================
@@ -1580,6 +1635,7 @@ def gx_validate_program(
     device_comments: Optional[Dict[str, str]] = None,
     auto_fix_negatives: bool = False,
     plc_type: str = "FX3U/FX3UC",
+    global_device_comments: Optional[Dict[str, str]] = None,
 ) -> str:
     """
     Pre-validates the conservative family-aware linear-rung subset without modifying GX Works2.
@@ -1588,14 +1644,21 @@ def gx_validate_program(
 
     Args:
         rungs: List of rung objects, each with {"statement": "optional rung title", "instructions": ["LD X0", "OUT Y0"]}.
-        device_comments: Optional dictionary mapping devices (e.g., {"X0": "START", "Y0": "MAIN CONTACTOR"}) to comments.
+        device_comments: Optional global mapping of any supported device to its comment.
+        global_device_comments: Explicit alias for device_comments; provide only one.
         plc_type: FXCPU/QCPU/LCPU family or a supported model name.
         auto_fix_negatives: If True, automatically converts LDN/ANDN/ORN to LDI/ANI/ORI.
     """
     if not isinstance(auto_fix_negatives, bool):
         return json.dumps({"valid": False, "errors": ["auto_fix_negatives must be a boolean."], "warnings": []}, indent=2)
+    if device_comments is not None and global_device_comments is not None:
+        return json.dumps(
+            {"valid": False, "errors": ["Provide either device_comments or global_device_comments, not both."], "warnings": []},
+            indent=2,
+        )
+    comments = global_device_comments if global_device_comments is not None else device_comments
     report = validate_and_analyze_program(
-        rungs, device_comments, auto_fix_negatives=auto_fix_negatives, plc_type=plc_type
+        rungs, comments, auto_fix_negatives=auto_fix_negatives, plc_type=plc_type
     )
     return json.dumps(
         {
@@ -1619,6 +1682,7 @@ def gx_validate_program(
 def gx_write_program(
     rungs: List[Dict[str, Any]],
     device_comments: Optional[Dict[str, str]] = None,
+    global_device_comments: Optional[Dict[str, str]] = None,
     delivery_mode: str = "csv_import",
     plc_type: str = "FX3U/FX3UC",
     run_compile_and_check: bool = True,
@@ -1629,7 +1693,8 @@ def gx_write_program(
 
     Args:
         rungs: Ordered rung objects with optional statement and instruction list, e.g. [{"statement": "Motor start/stop", "instructions": ["LD X0", "OR M0", "ANI X1", "OUT M0"]}].
-        device_comments: Optional dict of I/O comments, e.g. {"X0": "START", "X1": "STOP NO", "Y0": "MAIN CONTACTOR"}.
+        device_comments: Optional global device-comment map.
+        global_device_comments: Explicit alias for device_comments; provide only one.
         delivery_mode: Must be "csv_import". Simulated keystroke entry is not used for writes.
         plc_type: Target GX Works2 PLC family/model for CSV header.
         run_compile_and_check: Must be True; a write is not successful without GX Works2 build/check.
@@ -1640,13 +1705,16 @@ def gx_write_program(
         return json.dumps({"status": "REJECTED_BEFORE_WRITE", "error": "Only delivery_mode='csv_import' is supported for reliable writes."}, indent=2)
     if run_compile_and_check is not True:
         return json.dumps({"status": "REJECTED_BEFORE_WRITE", "error": "Build and program check are required; run_compile_and_check must be True."}, indent=2)
+    if device_comments is not None and global_device_comments is not None:
+        return json.dumps({"status": "REJECTED_BEFORE_WRITE", "error": "Provide either device_comments or global_device_comments, not both."}, indent=2)
+    comments = global_device_comments if global_device_comments is not None else device_comments
     profile, profile_error = resolve_plc_profile(plc_type)
     if profile_error or profile is None:
         return json.dumps({"status": "REJECTED_BEFORE_WRITE", "error": profile_error}, indent=2)
 
     # 1. Pre-flight deterministic validation (rejects bad opcodes before touching GX Works2)
     report = validate_and_analyze_program(
-        rungs, device_comments, auto_fix_negatives=False, plc_type=plc_type
+        rungs, comments, auto_fix_negatives=False, plc_type=plc_type
     )
     if not report.valid:
         return json.dumps(
@@ -1686,8 +1754,8 @@ def gx_write_program(
         )
 
     comment_csv_path: Optional[Path] = None
-    if device_comments:
-        comment_csv_content = generate_gxworks2_comment_csv(device_comments)
+    if comments:
+        comment_csv_content = generate_gxworks2_comment_csv(comments, plc_type=plc_type)
         comment_csv_path = save_utf16le_csv(
             comment_csv_content,
             new_artifact_path("comments-backup"),
@@ -1839,23 +1907,27 @@ def gx_write_program(
 def gx_write_device_comments(
     device_comments: Dict[str, str],
     import_via_gui: bool = False,
+    plc_type: str = "FX3U/FX3UC",
 ) -> str:
     """
-    Saves a validated GX Works2 Device Comment CSV artifact (UTF-16LE, tab-delimited).
+    Saves a validated global GX Works2 Device Comment CSV artifact (UTF-16LE, tab-delimited).
 
     Args:
-        device_comments: Mapping of device names to comments (max 32 chars recommended),
-                         e.g. {"X0": "START", "X1": "STOP NO", "Y0": "KONTAKTOR MAIN"}.
+        device_comments: Mapping of any supported global device names to comments.
         import_via_gui: Must be False; automatic Device Comment GUI import is unsupported.
+        plc_type: PLC family/model used for validation and CSV metadata.
     """
     if not isinstance(import_via_gui, bool):
         return json.dumps({"status": "REJECTED_BEFORE_WRITE", "errors": ["import_via_gui must be a boolean."]}, indent=2)
     if not isinstance(device_comments, dict) or not device_comments:
         return json.dumps({"status": "REJECTED_BEFORE_WRITE", "errors": ["device_comments must be a non-empty object."]}, indent=2)
-    errors = _validate_comment_map(device_comments)
+    profile, profile_error = resolve_plc_profile(plc_type)
+    if profile_error or profile is None:
+        return json.dumps({"status": "REJECTED_BEFORE_WRITE", "errors": [profile_error]}, indent=2)
+    errors = _validate_comment_map(device_comments, profile)
     if errors:
         return json.dumps({"status": "REJECTED_BEFORE_WRITE", "errors": errors}, indent=2)
-    content = generate_gxworks2_comment_csv(device_comments)
+    content = generate_gxworks2_comment_csv(device_comments, plc_type=plc_type)
     csv_path = save_utf16le_csv(content, new_artifact_path("comments"))
 
     gui_status = "Saved CSV artifact only; import it from the GX Works2 Device Comment editor."
@@ -1864,6 +1936,7 @@ def gx_write_device_comments(
             {
                 "status": "GUI_IMPORT_UNSUPPORTED",
                 "comment_count": len(device_comments),
+                "plc_type": plc_type,
                 "comment_csv_path": str(csv_path),
                 "error": (
                     "Automatic Device Comment import is not supported safely yet. "
@@ -1877,11 +1950,23 @@ def gx_write_device_comments(
         {
             "status": "SUCCESS",
             "comment_count": len(device_comments),
+            "plc_type": plc_type,
             "comment_csv_path": str(csv_path),
             "gui_status": gui_status,
         },
         indent=2,
     )
+
+
+@mcp.tool()
+def gx_read_global_device_comments(comment_csv_path: str) -> str:
+    """Reads and validates a previously exported global device-comment CSV."""
+    if not isinstance(comment_csv_path, str) or not comment_csv_path.strip():
+        return json.dumps({"success": False, "error": "comment_csv_path must be a non-empty path."}, indent=2)
+    path = Path(comment_csv_path).expanduser()
+    parsed = parse_gxworks2_comment_csv(path)
+    parsed["success"] = "error" not in parsed
+    return json.dumps(parsed, indent=2)
 
 
 @mcp.tool()

@@ -32,6 +32,36 @@ downloads to a PLC.
 
 Do not retry a write automatically after a timeout or uncertain result. Check the returned backup and rollback state first. A successful GX Works2 check is not proof of machine safety or a substitute for engineering review.
 
+## Global device comments
+
+AI agents can use global device comments for inputs, outputs, relays, timers,
+counters, registers, and other supported devices—not only I/O:
+
+```json
+{
+  "plc_type": "Q03UDCPU",
+  "global_device_comments": {
+    "X10": "START BUTTON",
+    "M100": "CYCLE ACTIVE",
+    "D100": "TARGET SPEED",
+    "W1A": "STATUS WORD"
+  }
+}
+```
+
+`global_device_comments` is accepted by `gx_validate_program` and
+`gx_write_program`; `device_comments` remains as a backwards-compatible alias.
+Use only one name per call. `gx_write_device_comments` creates a validated,
+PLC-specific UTF-16LE artifact, and `gx_read_global_device_comments` parses it
+back into a normalized map. Comments are validated for address range,
+duplicate addresses, CSV safety, and the 32-character limit.
+
+GX Works2 stores global comments through its Device Comment editor rather than
+the ladder editor. The server therefore does not pretend that saving the CSV
+has imported it: `import_via_gui=true` returns an explicit unsupported status
+and preserves the artifact for manual import. Ladder writes include the same
+validated comment artifact alongside their backup and verification artifacts.
+
 ## Ladder input
 
 Pass `rungs` as an ordered array. Each rung has an optional statement and an ordered list of instruction strings. Start every rung with an LD-family contact and include at least one output or data instruction. The safe linear format does not accept branches or stack instructions. Do not include `END`; GX Works2 supplies it.
@@ -67,6 +97,7 @@ until they can be round-tripped and verified.
 - `gx_validate_program`: validate the candidate without modifying GX Works2.
 - `gx_write_program`: validate, back up, replace, build, check, and read back MAIN. Keep the returned backup path on failure.
 - `gx_compile_and_check`: build and check the active MAIN program without replacing it.
-- `gx_write_device_comments`: save a comments CSV artifact. Automatic GUI import is unsupported. Comment text is limited to 32 characters and must not include quotes or control characters.
+- `gx_write_device_comments`: save a PLC-specific global device-comments CSV artifact. Automatic GUI import is unsupported. Comment text is limited to 32 characters and must not include quotes or control characters.
+- `gx_read_global_device_comments`: validate and read a previously generated global comment artifact.
 
 The tool serializes GUI operations. Generated artifacts are written to the server's `Documents/Codex-Gx` directory with unique names; existing files are never overwritten. Missing or unrecognized GUI results are failures.

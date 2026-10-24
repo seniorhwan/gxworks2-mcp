@@ -147,6 +147,37 @@ class ValidatorTests(unittest.TestCase):
 
 
 class CsvTests(unittest.TestCase):
+    def test_global_device_comments_round_trip_with_plc_metadata(self):
+        comments = {"X8": "START", "D10": "SETPOINT", "W1A": "STATUS WORD"}
+        with tempfile.TemporaryDirectory() as temp:
+            path = MODULE.save_utf16le_csv(
+                MODULE.generate_gxworks2_comment_csv(comments, plc_type="QCPU"),
+                Path(temp) / "global-comments.csv",
+            )
+            parsed = MODULE.parse_gxworks2_comment_csv(path)
+            self.assertNotIn("error", parsed)
+            self.assertEqual(parsed["plc_information"], "QCPU QCPU")
+            self.assertEqual(parsed["comments"], comments)
+
+    def test_global_device_comments_reject_wrong_family_addressing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "bad-comments.csv"
+            content = MODULE.generate_gxworks2_comment_csv({"X8": "NOT OCTAL"}, plc_type="QCPU")
+            path.write_bytes(b"\xff\xfe" + content.encode("utf-16-le"))
+            parsed = MODULE.parse_gxworks2_comment_csv(path)
+            self.assertNotIn("error", parsed)
+            self.assertEqual(parsed["comments"]["X8"], "NOT OCTAL")
+
+    def test_global_device_comments_reject_duplicate_addresses(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "duplicate-comments.csv"
+            content = MODULE.generate_gxworks2_comment_csv({"X1": "A"}, plc_type="QCPU")
+            content = content.replace('"X1"\t"A"', '"X1"\t"A"\r\n"X001"\t"B"')
+            path.write_bytes(b"\xff\xfe" + content.encode("utf-16-le"))
+            parsed = MODULE.parse_gxworks2_comment_csv(path)
+            self.assertIn("error", parsed)
+            self.assertIn("Duplicate", parsed["error"])
+
     def test_csv_header_uses_selected_plc_family(self):
         q_csv = MODULE.generate_gxworks2_ladder_csv(
             MODULE.validate_and_analyze_program(
