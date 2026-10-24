@@ -147,6 +147,18 @@ class ValidatorTests(unittest.TestCase):
 
 
 class CsvTests(unittest.TestCase):
+    def test_candidate_signature_matches_gx_padded_octal_devices(self):
+        rungs = [{"statement": "Octal input", "instructions": ["LD X010", "OUT Y007"]}]
+        report = MODULE.validate_and_analyze_program(rungs)
+        csv_text = MODULE.generate_gxworks2_ladder_csv(report.normalized_rungs)
+        with tempfile.TemporaryDirectory() as temp:
+            path = MODULE.save_utf16le_csv(csv_text, Path(temp) / "octal.csv")
+            parsed = MODULE.parse_gxworks2_ladder_csv(path)
+            self.assertEqual(
+                MODULE.instruction_signature(parsed["items"]),
+                MODULE.candidate_signatures(report.normalized_rungs)[0],
+            )
+
     def test_global_device_comments_round_trip_with_plc_metadata(self):
         comments = {"X8": "START", "D10": "SETPOINT", "W1A": "STATUS WORD"}
         with tempfile.TemporaryDirectory() as temp:
@@ -333,6 +345,23 @@ class GuiResultTests(unittest.TestCase):
         c._dismiss_popups = lambda confirm=True, timeout=0.8: ["Build completed"]
         self.assertTrue(c.compile_build()[0])
 
+    def test_build_accepts_zero_error_status_bar(self):
+        c = MODULE.GXWorks2Controller()
+        c.connect = lambda: (True, "title")
+        c.main_editor_is_active = lambda expected_project=None: (True, "title")
+        c.main_win = type("Main", (), {
+            "set_focus": lambda self: None,
+            "descendants": lambda self: [type("Status", (), {"window_text": lambda self: "Error: 0, Warning: 0"})()],
+        })()
+        c._dismiss_popups = lambda confirm=True, timeout=0.8: []
+        old_send_keys = MODULE.send_keys if hasattr(MODULE, "send_keys") else None
+        MODULE.send_keys = lambda *args, **kwargs: None
+        try:
+            self.assertTrue(c.compile_build()[0])
+        finally:
+            if old_send_keys is not None:
+                MODULE.send_keys = old_send_keys
+
     def test_unknown_modal_is_not_dismissed_as_confirmation(self):
         class Child:
             def __init__(self, text, kind): self.text, self.kind = text, kind
@@ -354,6 +383,26 @@ class GuiResultTests(unittest.TestCase):
         c.main_win = type("Main", (), {"handle": 1})()
         with self.assertRaisesRegex(RuntimeError, "Unrecognized modal dialog"):
             c._dismiss_popups()
+
+    def test_transient_empty_modal_is_ignored(self):
+        class Child:
+            def window_text(self): return ""
+            def friendly_class_name(self): return "Button"
+
+        class Dialog:
+            handle = 2
+            def window_text(self): return ""
+            def class_name(self): return "#32770"
+            def is_enabled(self): return True
+            def children(self): return [Child()]
+
+        class App:
+            def windows(self, visible_only=True): return [Dialog()]
+
+        c = MODULE.GXWorks2Controller()
+        c.app = App()
+        c.main_win = type("Main", (), {"handle": 1})()
+        self.assertEqual(c._dismiss_popups(timeout=0.01), [])
 
     def test_program_check_requires_explicit_zero_error_evidence(self):
         class Button:

@@ -38,6 +38,7 @@ Running via Antigravity or VS Code MCP Configuration:
 from __future__ import annotations
 
 import csv
+import ctypes
 import datetime
 import io
 import json
@@ -863,24 +864,26 @@ def plc_family_from_csv_info(plc_information: str) -> Optional[str]:
 
 def instruction_signature(items: List[Dict[str, Any]]) -> List[Tuple[str, Tuple[str, ...]]]:
     """Return ordered instruction/operand pairs for candidate/readback comparison."""
-    def canonical_operand(value: Any) -> str:
-        operand = str(value).strip().upper()
-        if re.fullmatch(r"H[0-9A-F]+", operand):
-            return "H" + (operand[1:].lstrip("0") or "0")
-        match = re.match(r"^([A-Z]+)(0*)([0-9]+)$", operand)
-        if not match:
-            return operand
-        prefix, _, digits = match.groups()
-        # GX Works2 pads device numbers (X0 -> X000) when exporting. Decimal
-        # devices/constants and hexadecimal constants compare without padding.
-        normalized = digits.lstrip("0") or "0"
-        return prefix + normalized
-
     return [
-        (str(item["opcode"]).strip().upper(), tuple(canonical_operand(op) for op in item.get("operands", [])))
+        (
+            str(item["opcode"]).strip().upper(),
+            tuple(_canonical_signature_operand(op) for op in item.get("operands", [])),
+        )
         for item in items
         if item.get("type") == "instruction"
     ]
+
+
+def _canonical_signature_operand(value: Any) -> str:
+    """Normalize GX Works2's padded device spelling for candidate/readback equality."""
+    operand = str(value).strip().upper()
+    if re.fullmatch(r"H[0-9A-F]+", operand):
+        return "H" + (operand[1:].lstrip("0") or "0")
+    match = re.match(r"^([A-Z]+)(0*)([0-9]+)$", operand)
+    if not match:
+        return operand
+    prefix, _, digits = match.groups()
+    return prefix + (digits.lstrip("0") or "0")
 
 
 def statement_signature(statements: List[str]) -> List[str]:
@@ -897,7 +900,9 @@ def candidate_signatures(rungs: List[RungSpec]) -> Tuple[List[Tuple[str, Tuple[s
         for line in rung.instructions:
             tokens = line.split()
             if tokens:
-                instructions.append((tokens[0].upper(), tuple(token.upper() for token in tokens[1:])))
+                instructions.append(
+                    (tokens[0].upper(), tuple(_canonical_signature_operand(token) for token in tokens[1:]))
+                )
     # GX Works2 CSV generator adds the terminal END instruction itself.
     instructions.append(("END", ()))
     return instructions, statements
@@ -1006,13 +1011,38 @@ class GXWorks2Controller:
                 timeout=3.0,
             )
             self.main_win = self.app.window(class_name="GXW2FrameWnd")
-            self.main_win.set_focus()
+            try:
+                self.main_win.set_focus()
+            except Exception:
+                # Windows may deny foreground activation while GX Works2 is
+                # already visible; a valid attached window can still process
+                # the native commands below.
+                pass
             return True, self.main_win.window_text()
         except Exception as exc:
             return (
                 False,
                 f"Could not attach to GX Works2 window (make sure GX Works2 is open with a project): {exc}",
             )
+
+    def _try_focus(self) -> None:
+        """Best-effort focus; Windows can reject foreground activation."""
+        if self.main_win is not None:
+            try:
+                handle = self.main_win.handle
+                ctypes.windll.user32.ShowWindow(handle, 9)
+                ctypes.windll.user32.BringWindowToTop(handle)
+                ctypes.windll.user32.SetForegroundWindow(handle)
+                self.main_win.set_focus()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _dialog_is_visible(dialog: Any) -> bool:
+        try:
+            return bool(dialog.is_visible())
+        except Exception:
+            return False
 
     def launch(self) -> Tuple[bool, str]:
         """Launch GX Works2 from an explicit path or common installation locations."""
@@ -1064,7 +1094,7 @@ class GXWorks2Controller:
         if not ok:
             return False, title
         try:
-            self.main_win.set_focus()
+            self._try_focus()
             send_keys("^n")
             deadline = time.time() + 8.0
             dialog = None
@@ -1144,21 +1174,35 @@ class GXWorks2Controller:
                 main_handle = self.main_win.handle if self.main_win else None
                 dialogs = []
                 for window in self.app.windows(visible_only=True):
-                    if (window.handle == main_handle or window.class_name() != "#32770"
-                            or not window.is_enabled()):
+                    try:
+                        if (window.handle == main_handle or window.class_name() != "#32770"
+                                or not window.is_enabled()):
+                            continue
+                        children = window.children()
+                        buttons = [
+                            child.window_text().replace("&", "").strip().lower()
+                            for child in children
+                            if child.friendly_class_name() == "Button"
+                        ]
+                    except Exception:
+                        # Native dialogs can disappear between enumeration and
+                        # inspection while GX Works2 transitions between views.
                         continue
-                    buttons = [
-                        child.window_text().replace("&", "").strip().lower()
-                        for child in window.children()
-                        if child.friendly_class_name() == "Button"
-                    ]
+                    buttons = [label for label in buttons if label]
+                    if "check program" in window.window_text().lower():
+                        # The check dialog is owned by run_check_program and
+                        # must remain open while its result list is inspected.
+                        continue
                     # Do not treat the CSV Open/Save picker as a confirmation popup.
                     has_message_buttons = any(label in buttons for label in ("yes", "no", "ok"))
                     has_melsoft_title = "melsoft" in window.window_text().lower()
-                    has_text = any(
-                        child.friendly_class_name() == "Static" and child.window_text().strip()
-                        for child in window.children()
-                    )
+                    try:
+                        has_text = any(
+                            child.friendly_class_name() == "Static" and child.window_text().strip()
+                            for child in children
+                        )
+                    except Exception:
+                        continue
                     if has_message_buttons and has_melsoft_title and has_text:
                         dialogs.append(window)
                     elif not buttons:
@@ -1215,7 +1259,7 @@ class GXWorks2Controller:
         if not is_main:
             raise RuntimeError(active_msg)
 
-        self.main_win.set_focus()
+        self._try_focus()
         # Posting returns immediately. Sending synchronously deadlocks here because
         # GX Works2 opens a modal confirmation while processing WM_COMMAND and waits
         # for the user before the caller can reach the popup handler below.
@@ -1227,8 +1271,12 @@ class GXWorks2Controller:
             # Handle that modal in this wait loop or the expected picker never appears.
             self._last_csv_confirmation.extend(self._dismiss_popups(confirm=True, timeout=0.15))
             for dialog in self.app.windows(title_re=title_regex):
-                if dialog.is_visible() and dialog.is_enabled():
-                    return self.app.window(handle=dialog.handle)
+                try:
+                    if dialog.is_visible() and dialog.is_enabled():
+                        handle = dialog.handle
+                        return self.app.window(handle=handle)
+                except Exception:
+                    continue
             time.sleep(0.1)
         raise RuntimeError(f"GX Works2 did not open the expected CSV dialog: {title_regex}")
 
@@ -1245,7 +1293,7 @@ class GXWorks2Controller:
         """Brings the MAIN ladder editor window into focus and switches to Write mode (F2)."""
         if not self.main_win:
             return
-        self.main_win.set_focus()
+        self._try_focus()
         time.sleep(0.15)
         # Ensure we are in Write Mode (F2 in GX Works2 switches to Write Mode)
         send_keys("{F2}")
@@ -1270,15 +1318,15 @@ class GXWorks2Controller:
             if output_path.exists():
                 return False, f"Refusing to overwrite existing CSV artifact: {output_path}"
 
-            self.main_win.set_focus()
+            self._try_focus()
             time.sleep(0.15)
 
             dialog = self._open_csv_dialog(GX_WRITE_CSV_COMMAND, r".*Write to CSV File.*")
             self._set_file_dialog_path(dialog, output_path, "&Save")
             close_deadline = time.time() + 2.0
-            while time.time() < close_deadline and dialog.is_visible():
+            while time.time() < close_deadline and self._dialog_is_visible(dialog):
                 time.sleep(0.1)
-            if dialog.is_visible():
+            if self._dialog_is_visible(dialog):
                 return False, "CSV Save dialog remained visible after selecting the destination."
             deadline = time.time() + GX_CSV_OPERATION_TIMEOUT
             previous_size = -1
@@ -1325,7 +1373,7 @@ class GXWorks2Controller:
             return False, f"Import CSV failed preflight: {exc}"
 
         try:
-            self.main_win.set_focus()
+            self._try_focus()
             time.sleep(0.15)
 
             dialog = self._open_csv_dialog(GX_READ_CSV_COMMAND, r".*Read from CSV File.*")
@@ -1334,11 +1382,11 @@ class GXWorks2Controller:
                 return False, f"Target project/editor changed before CSV selection: {active_msg}"
             self.import_started = True
             self._set_file_dialog_path(dialog, csv_path, "&Open")
-            if dialog.is_visible():
+            if self._dialog_is_visible(dialog):
                 deadline = time.time() + 2.0
-                while time.time() < deadline and dialog.is_visible():
+                while time.time() < deadline and self._dialog_is_visible(dialog):
                     time.sleep(0.1)
-                if dialog.is_visible():
+                if self._dialog_is_visible(dialog):
                     return False, "CSV Open dialog remained visible after selecting the candidate."
             popups = self._dismiss_popups(confirm=True, timeout=1.5)
             popup_text = " ".join(popups).lower()
@@ -1362,7 +1410,7 @@ class GXWorks2Controller:
             return False, [active_msg]
 
         try:
-            self.main_win.set_focus()
+            self._try_focus()
             time.sleep(0.15)
             try:
                 self.main_win.menu_select("Compile->Build")
@@ -1374,8 +1422,30 @@ class GXWorks2Controller:
             failure_terms = ("error", "failed", "cannot", "unable", "invalid", "not supported")
             if any(term in popup_text for term in failure_terms):
                 return False, popups
-            if not re.search(r"\b(build|compile)\b.*\b(complete|completed|success|successful)\b|\b(complete|completed|success|successful)\b.*\b(build|compile)\b", popup_text):
+            explicit_success = bool(re.search(
+                r"\b(build|compile)\b.*\b(complete|completed|success|successful)\b|"
+                r"\b(complete|completed|success|successful)\b.*\b(build|compile)\b",
+                popup_text,
+            ))
+            status_text: List[str] = []
+            try:
+                status_text = [
+                    child.window_text().strip()
+                    for child in self.main_win.descendants()
+                    if child.window_text().strip()
+                ]
+            except Exception:
+                status_text = []
+            status_summary = " ".join(status_text)
+            zero_error_status = bool(re.search(
+                r"\bErrors?\s*:\s*0\b.*\bWarnings?\s*:\s*0\b",
+                status_summary,
+                re.IGNORECASE,
+            ))
+            if not explicit_success and not zero_error_status:
                 return False, popups + ["No explicit GX Works2 build-success result was observed."]
+            if zero_error_status and not explicit_success:
+                popups.append("GX Works2 status: Error: 0, Warning: 0")
             is_main, active_msg = self.main_editor_is_active(self.project_key)
             if not is_main:
                 return False, popups + [active_msg]
@@ -1397,19 +1467,26 @@ class GXWorks2Controller:
             return {"passed": False, "error": active_msg, "findings": []}
 
         try:
-            self.main_win.set_focus()
+            self._try_focus()
             time.sleep(0.15)
             # GX Works2's XTP menu is owner-drawn and is not exposed to
             # pywinauto menu_select. Tool opens with the first row selected;
             # one Down selects "Check Program..." in the supported GX Works2 UI.
-            send_keys("%t")
-            time.sleep(0.15)
-            send_keys("{DOWN}")
-            send_keys("{ENTER}")
-            time.sleep(0.5)
-
             chk_dlg = self.app.window(title_re=r".*Check Program.*")
-            if chk_dlg.exists(timeout=2.0):
+            dialog_opened = False
+            for attempt in range(3):
+                self._try_focus()
+                send_keys("%t")
+                time.sleep(0.15)
+                send_keys("{DOWN}")
+                send_keys("{ENTER}")
+                if chk_dlg.exists(timeout=8.0):
+                    dialog_opened = True
+                    break
+                send_keys("{ESC}")
+                time.sleep(0.2)
+
+            if dialog_opened:
                 chk_dlg.set_focus()
                 execute = next((
                     child for child in chk_dlg.descendants()
@@ -1420,15 +1497,31 @@ class GXWorks2Controller:
                     send_keys("{ESC}")
                     return {"passed": False, "error": "Check Program dialog has no Execute button.", "findings": []}
                 execute.click()
-                time.sleep(0.6)
+                deadline = time.time() + 8.0
+                while time.time() < deadline:
+                    try:
+                        check_text = " ".join(
+                            child.window_text().strip()
+                            for child in chk_dlg.descendants()
+                            if child.window_text().strip()
+                        )
+                    except Exception:
+                        check_text = ""
+                    if re.search(r"completed|no error|error\s*:", check_text, re.IGNORECASE):
+                        break
+                    time.sleep(0.25)
 
                 # Dismiss "Checking program completed." info box
                 info_msgs = self._dismiss_popups(confirm=True, timeout=1.5)
 
                 # Inspect ListView inside Check Program dialog for any syntax/duplicate errors
                 findings: List[str] = []
+                dialog_messages: List[str] = []
                 try:
                     for child in chk_dlg.descendants():
+                        text = child.window_text().strip()
+                        if text:
+                            dialog_messages.append(text)
                         if child.friendly_class_name() == "ListView":
                             for item in child.items():
                                 txt = item.text().strip()
@@ -1456,7 +1549,7 @@ class GXWorks2Controller:
                     if not re.search(r"\bno errors? found\b|\berrors?\s*[:=]\s*0\b", finding, re.IGNORECASE)
                 ]
 
-                combined_text = " ".join(info_msgs + findings).lower()
+                combined_text = " ".join(info_msgs + dialog_messages + findings).lower()
                 explicit_success = bool(
                     re.search(r"\bno errors? found\b", combined_text)
                     or re.search(r"\berrors?\s*[:=]\s*0\b", combined_text)
@@ -1466,7 +1559,7 @@ class GXWorks2Controller:
 
                 return {
                     "passed": explicit_success and len(findings) == 0,
-                    "dialog_messages": info_msgs,
+                    "dialog_messages": info_msgs + dialog_messages,
                     "findings": findings,
                 }
             return {"passed": False, "error": "GX Works2 did not open the Check Program dialog.", "findings": []}
