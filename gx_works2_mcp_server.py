@@ -913,11 +913,14 @@ class GXWorks2Controller:
                     )
                     if has_message_buttons and has_melsoft_title and has_text:
                         dialogs.append(window)
-                    elif not buttons or not has_text:
+                    elif not buttons:
                         # GX Works2 briefly creates an empty owner dialog while
                         # transitioning between its frame and the native picker.
                         continue
-                    elif not any(label in buttons for label in ("open", "save", "cancel")):
+                    elif any(label in buttons for label in ("open", "save", "cancel")):
+                        # The native CSV picker is not a confirmation popup.
+                        continue
+                    else:
                         raise RuntimeError(
                             f"Unrecognized modal dialog '{window.window_text()}' with buttons {buttons}."
                         )
